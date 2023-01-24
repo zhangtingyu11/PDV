@@ -99,7 +99,9 @@ class AnchorHeadTemplate(nn.Module):
         return targets_dict
 
     def get_cls_layer_loss(self):
-        cls_preds = self.forward_ret_dict['cls_preds']
+        #* [batch_size, 200, 176, anchor_num*class_num*class_num]
+        cls_preds = self.forward_ret_dict['cls_preds']\
+        #* [batch_size, 200*176*anchor_num*clss_num]
         box_cls_labels = self.forward_ret_dict['box_cls_labels']
         batch_size = int(cls_preds.shape[0])
         cared = box_cls_labels >= 0  # [N, num_anchors]
@@ -161,8 +163,11 @@ class AnchorHeadTemplate(nn.Module):
 
     def get_box_reg_layer_loss(self):
         box_preds = self.forward_ret_dict['box_preds']
+        #* [batch_size, 200, 176, anchor_num*class_num*angle_bin]
         box_dir_cls_preds = self.forward_ret_dict.get('dir_cls_preds', None)
+        #* [batch_size, 200*176*anchor_num*class_num, 7]
         box_reg_targets = self.forward_ret_dict['box_reg_targets']
+        #* [batch_size, 200*176*anchor_num*class_num]
         box_cls_labels = self.forward_ret_dict['box_cls_labels']
         batch_size = int(box_preds.shape[0])
 
@@ -180,11 +185,14 @@ class AnchorHeadTemplate(nn.Module):
                 anchors = torch.cat(self.anchors, dim=-3)
         else:
             anchors = self.anchors
+        #* anchors:[1, 200, 176, class_num, anchor_num, 7]->[batch_size, 200*176*class_num*anchor_num, 7]
         anchors = anchors.view(1, -1, anchors.shape[-1]).repeat(batch_size, 1, 1)
+        #* [batch_size, 200, 176, class_num*anchor_num*7]->[batch_size, 200*176*class_num*anchor_num, 7]
         box_preds = box_preds.view(batch_size, -1,
                                    box_preds.shape[-1] // self.num_anchors_per_location if not self.use_multihead else
                                    box_preds.shape[-1])
         # sin(a - b) = sinacosb-cosasinb
+        #* 预测的航向角变成了sincos, 目标变成了cossin
         box_preds_sin, reg_targets_sin = self.add_sin_difference(box_preds, box_reg_targets)
         loc_loss_src = self.reg_loss_func(box_preds_sin, reg_targets_sin, weights=reg_weights)  # [N, M]
         loc_loss = loc_loss_src.sum() / batch_size

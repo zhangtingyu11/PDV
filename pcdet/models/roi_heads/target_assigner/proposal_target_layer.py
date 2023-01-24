@@ -8,6 +8,19 @@ from ....ops.iou3d_nms import iou3d_nms_utils
 class ProposalTargetLayer(nn.Module):
     def __init__(self, roi_sampler_cfg):
         super().__init__()
+        """
+            self.roi_sampler_cfg:
+                BOX_CODER: 生成的roi的包围框的box_coder
+                CLS_BG_THRESH: 背景框的分类的阈值
+                CLS_BG_THRESH_LO: easy_bg的分类的阈值
+                CLS_FG_THRESH: 前景框的分类的阈值
+                CLS_SCORE_TYPE: 分类的目标
+                FG_RATIO: 生成的roi的前景框的比例
+                HARD_BG_RATIO: 生成的hard_bg在bg中的比例
+                REG_FG_THRESH: 前景regression的阈值
+                ROI_PER_IMAGE: 生成的roi的个数
+                SAMPLE_ROI_BY_EACH_CLASS: 是否根据类别来采样roi
+        """
         self.roi_sampler_cfg = roi_sampler_cfg
 
     def forward(self, batch_dict):
@@ -15,7 +28,7 @@ class ProposalTargetLayer(nn.Module):
         Args:
             batch_dict:
                 batch_size:
-                rois: (B, num_rois, 7 + C)
+                rois: (B, num_rois, 7)
                 roi_scores: (B, num_rois)
                 gt_boxes: (B, N, 7 + C + 1)
                 roi_labels: (B, num_rois)
@@ -28,6 +41,13 @@ class ProposalTargetLayer(nn.Module):
                 roi_labels: (B, M)
                 reg_valid_mask: (B, M)
                 rcnn_cls_labels: (B, M)
+        """
+        """
+            batch_rois: [batch_size, ROI_PER_IMAGE, 7]来表示roi
+            batch_gt_of_rois: [batch_size, ROI_PER_IMAGE, 8]来表示roi对应的gt
+            batch_roi_ious: [batch_size, ROI_PER_IMAGE]来表示roi和对应gt的iou
+            batch_roi_scores: [batch_size, ROI_PER_IMAGE]来表示roi对应的置信度
+            batch_roi_labels: [batch_size, ROI_PER_IMAGE]来表示roi对应的分类标签, 也不算标签, 就是置信度最大的类别
         """
         batch_rois, batch_gt_of_rois, batch_roi_ious, batch_roi_scores, batch_roi_labels = self.sample_rois_for_rcnn(
             batch_dict=batch_dict
@@ -42,6 +62,11 @@ class ProposalTargetLayer(nn.Module):
                           (batch_roi_ious < self.roi_sampler_cfg.CLS_FG_THRESH)
             batch_cls_labels[ignore_mask > 0] = -1
         elif self.roi_sampler_cfg.CLS_SCORE_TYPE == 'roi_iou':
+            """
+                超过CLS_FG_THRESH的roi的分类类别为1
+                小于CLS_BG_THRESH的roi的分类类别为0
+                在CLS_BG_THRESH~CLS_FG_THRESH的roi的分类类别为(iou-CLS_BG_THRESH)/(CLS_FG_THRESH-CLS_BG_THRESH)
+            """
             iou_bg_thresh = self.roi_sampler_cfg.CLS_BG_THRESH
             iou_fg_thresh = self.roi_sampler_cfg.CLS_FG_THRESH
             fg_mask = batch_roi_ious > iou_fg_thresh
@@ -58,7 +83,17 @@ class ProposalTargetLayer(nn.Module):
                         'roi_scores': batch_roi_scores, 'roi_labels': batch_roi_labels,
                         'reg_valid_mask': reg_valid_mask,
                         'rcnn_cls_labels': batch_cls_labels}
-
+        """
+        Returns:
+            targets_dict: 
+                rois: [batch_size, roi_num, 7], roi的信息, [x, y, z, dx, dy, dz, heading]
+                gt_of_rois: [batch_size, roi_num, 8], roi对应的gt框的信息, [x, y, z, dx, dy, dz, heading, class]
+                gt_iou_of_rois: [batch_size, roi_num], roi和对应gt的iou
+                roi_scores: [batch_size, roi_num], roi对应的置信度
+                roi_labels: [batch_size, roi_num], roi置信度最高的类别
+                reg_valid_mask: 满足回归阈值的roi的掩码
+                rcnn_cls_labels: roi的分类标签
+        """
         return targets_dict
 
     def sample_rois_for_rcnn(self, batch_dict):
@@ -66,9 +101,9 @@ class ProposalTargetLayer(nn.Module):
         Args:
             batch_dict:
                 batch_size:
-                rois: (B, num_rois, 7 + C)
+                rois: (B, num_rois, 7)
                 roi_scores: (B, num_rois)
-                gt_boxes: (B, N, 7 + C + 1)
+                gt_boxes: (B, N, 7+1), [x, y, z, dx, dy, dz, heading, class]
                 roi_labels: (B, num_rois)
         Returns:
 
@@ -96,6 +131,11 @@ class ProposalTargetLayer(nn.Module):
             cur_gt = cur_gt.new_zeros((1, cur_gt.shape[1])) if len(cur_gt) == 0 else cur_gt
 
             if self.roi_sampler_cfg.get('SAMPLE_ROI_BY_EACH_CLASS', False):
+                """
+                    只对同类别的iou和gt计算iou
+                    max_overlaps: 每个roi和他最大gt的iou
+                    gt_assignment: 每个roi分配的gt
+                """
                 max_overlaps, gt_assignment = self.get_max_iou_with_same_class(
                     rois=cur_roi, roi_labels=cur_roi_labels,
                     gt_boxes=cur_gt[:, 0:7], gt_labels=cur_gt[:, -1].long()
@@ -104,6 +144,7 @@ class ProposalTargetLayer(nn.Module):
                 iou3d = iou3d_nms_utils.boxes_iou3d_gpu(cur_roi, cur_gt[:, 0:7])  # (M, N)
                 max_overlaps, gt_assignment = torch.max(iou3d, dim=1)
 
+            #* 根据iou划分fg, easy_bg, hard_bg, 按照一定比例对iou进行下采样
             sampled_inds = self.subsample_rois(max_overlaps=max_overlaps)
 
             batch_rois[index] = cur_roi[sampled_inds]
@@ -111,7 +152,15 @@ class ProposalTargetLayer(nn.Module):
             batch_roi_ious[index] = max_overlaps[sampled_inds]
             batch_roi_scores[index] = cur_roi_scores[sampled_inds]
             batch_gt_of_rois[index] = cur_gt[gt_assignment[sampled_inds]]
+        """
 
+        Returns:
+            batch_rois: [batch_size, ROI_PER_IMAGE, 7]来表示roi
+            batch_gt_of_rois: [batch_size, ROI_PER_IMAGE, 8]来表示roi对应的gt
+            batch_roi_ious: [batch_size, ROI_PER_IMAGE]来表示roi和对应gt的iou
+            batch_roi_scores: [batch_size, ROI_PER_IMAGE]来表示roi对应的置信度
+            batch_roi_labels: [batch_size, ROI_PER_IMAGE]来表示roi对应的分类标签, 也不算标签, 就是置信度最大的类别
+        """
         return batch_rois, batch_gt_of_rois, batch_roi_ious, batch_roi_scores, batch_roi_labels
 
     def subsample_rois(self, max_overlaps):
@@ -225,4 +274,10 @@ class ProposalTargetLayer(nn.Module):
                 max_overlaps[roi_mask] = cur_max_overlaps
                 gt_assignment[roi_mask] = original_gt_assignment[cur_gt_assignment]
 
+        """
+        Returns:
+            只对同类别的iou和gt计算iou
+            max_overlaps: 每个roi和他最大gt的iou
+            gt_assignment: 每个roi分配的gt
+        """
         return max_overlaps, gt_assignment

@@ -127,13 +127,13 @@ MODEL:
                     POOL_RADIUS: [0.4, 0.8]
                     NSAMPLE: [16, 16]
                     POOL_METHOD: max_pool
-                    USE_DENSITY: True
+                    USE_DENSITY: False
                 x_conv4:
                     MLPS: [[32, 32], [32, 32]]
                     POOL_RADIUS: [0.8, 1.6]
                     NSAMPLE: [16, 16]
                     POOL_METHOD: max_pool
-                    USE_DENSITY: True
+                    USE_DENSITY: False
 
             ATTENTION:
                 ENABLED: True
@@ -141,7 +141,7 @@ MODEL:
                 NUM_HEADS: 1
                 NUM_HIDDEN_FEATURES: 128
                 NUM_LAYERS: 1
-                POSITIONAL_ENCODER: density_grid_points
+                POSITIONAL_ENCODER: grid_points
                 MAX_NUM_BOXES: 20
                 DROPOUT: 0.1
                 COMBINE: True
@@ -149,7 +149,7 @@ MODEL:
 
         # Density confidence prediction
         DENSITY_CONFIDENCE:
-            ENABLED: True
+            ENABLED: False
             GRID_SIZE: 1
             MAX_NUM_BOXES: 20
             ADD_SHARED_FEATURES: True

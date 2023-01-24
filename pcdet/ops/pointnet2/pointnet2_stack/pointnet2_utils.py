@@ -71,11 +71,17 @@ class BallQueryCount(Function):
 
         B = xyz_batch_cnt.shape[0]
         M = new_xyz.shape[0]
+        #* 每个grid point找到在半径内的nsample个特征点
         idx = torch.cuda.IntTensor(M, nsample).zero_() - 1
 
         pointnet2.ball_query_count_wrapper(B, M, radius, nsample, new_xyz, new_xyz_batch_cnt, xyz, xyz_batch_cnt, idx)
         empty_ball_mask = (idx[:, 0] == -1)
         idx[empty_ball_mask] = 0
+        """
+        Returns:
+            idx: [grid_point个数, nsample], 记录每个grid_point半径内的特征点的索引
+            empty_ball_mask: [grid_point个数], 如果这个grid point半径内没有特征点, 则为True
+        """
         return idx, empty_ball_mask
 
     @staticmethod
@@ -180,12 +186,19 @@ class QueryAndGroup(nn.Module):
 
         # idx: (M1 + M2 ..., nsample), empty_ball_mask: (M1 + M2 ...)
         if self.use_density:
+            """
+                idx: [grid_point个数, nsample], 记录每个grid_point半径内的特征点的索引
+                empty_ball_mask: [grid_point个数], 如果这个grid point半径内没有特征点, 则为True
+            """
             idx, empty_ball_mask = ball_query_count(self.radius, self.nsample, xyz, xyz_batch_cnt, new_xyz, new_xyz_batch_cnt)
             idx_count = idx.clone()
+            #* 如果半径内的点不足nsample个, 就用里面记录的第一个点的所有补全
             idx[idx == -1] = torch.repeat_interleave(idx[:, 0], (idx == -1).sum(-1), dim=0)
         else:
             idx, empty_ball_mask = ball_query(self.radius, self.nsample, xyz, xyz_batch_cnt, new_xyz, new_xyz_batch_cnt)
+        #* grouped_xyz为[grid point个数, 3, nsample]
         grouped_xyz = grouping_operation(xyz, xyz_batch_cnt, idx, new_xyz_batch_cnt)  # (M1 + M2, 3, nsample)
+        #* 求点相对坐标
         grouped_xyz -= new_xyz.unsqueeze(-1)
 
         grouped_xyz[empty_ball_mask] = 0
@@ -193,15 +206,20 @@ class QueryAndGroup(nn.Module):
         if self.use_density:
             # Assumes equal M1, M2, etc
             with torch.no_grad():
+                #* grouped_xyz为[grid point个数, nsample, 3]
                 grouped_xyz_permuted = grouped_xyz.permute(0, 2, 1)
+                #* kde_mask是[grid point个数, nsample], 如果有点就是true, 不足的地方是false
                 kde_mask = ((idx_count != -1) & (~empty_ball_mask).unsqueeze(1)).bool()
+                #* grouped_density为[]
                 grouped_density = self.kde.score_samples(grouped_xyz_permuted, kde_mask, grouped_xyz_permuted).unsqueeze(-2)
                 grouped_density[empty_ball_mask] = 0
 
         if features is not None:
+            #* grouped_features为[grid point个数, C, nsample]
             grouped_features = grouping_operation(features, xyz_batch_cnt, idx, new_xyz_batch_cnt)  # (M1 + M2, C, nsample)
             grouped_features[empty_ball_mask] = 0
             if self.use_xyz and self.use_density:
+                #* [grid point个数, C+3+1. nsample]
                 new_features = torch.cat([grouped_xyz, grouped_density, grouped_features], dim=1)  # (M1 + M2 ..., C + 3, nsample)
             elif self.use_xyz:
                 new_features = torch.cat([grouped_xyz, grouped_features], dim=1)  # (M1 + M2 ..., C + 3, nsample)
@@ -211,6 +229,11 @@ class QueryAndGroup(nn.Module):
             assert self.use_xyz, "Cannot have not features and not use xyz as a feature!"
             new_features = grouped_xyz
 
+        """
+        Returns:
+            new_features: [grid point个数, C+3+1, nsample]
+            idx: [grid_point个数, nsample], grid_point周围的特征点的索引, 如果周围没有特征点, 则索引都是0, 否则不足的用第一个内部第一个点的索引补全
+        """
         return new_features, idx
 
 

@@ -82,13 +82,14 @@ class BaseBEVBackbone(nn.Module):
         """
         Args:
             data_dict:
-                spatial_features
+                spatial_features: 2D feature map, [B, C*D, H, W]
         Returns:
         """
         spatial_features = data_dict['spatial_features']
         ups = []
         ret_dict = {}
         x = spatial_features
+        #* 先下采样再上采样
         for i in range(len(self.blocks)):
             x = self.blocks[i](x)
 
@@ -99,6 +100,7 @@ class BaseBEVBackbone(nn.Module):
             else:
                 ups.append(x)
 
+        #* 将上采样得到的特征进行拼接
         if len(ups) > 1:
             x = torch.cat(ups, dim=1)
         elif len(ups) == 1:
@@ -107,6 +109,7 @@ class BaseBEVBackbone(nn.Module):
         if len(self.deblocks) > len(self.blocks):
             x = self.deblocks[-1](x)
 
+        #* [batch_size, 512, 200, 176]
         data_dict['spatial_features_2d'] = x
 
         return data_dict

@@ -18,19 +18,21 @@ class TransformerEncoder(nn.Module):
     def forward(self, point_features, positional_input, src_key_padding_mask=None):
         """
         Args:
-            point_features: (b, xyz, f)
-            positional_input: (b, xyz, 3)
-            src_key_padding_mask: (b, xyz)
+            point_features: (batch_size*roi_num, grid_size**3, C)
+            positional_input: (batch_size*roi_num, grid_size**3, 4), 包含grid的密度信息
+            src_key_padding_mask: (batch_size*roi_num, grid_size**3), True表示这个grid point周围没特征点
 
         Returns:
             point_features: (b, xyz, f)
         """
         # Clone point features to prevent mutating input arguments
+        #* [batch_size*roi_num, grid_size**3, C]
         attended_features = torch.clone(point_features)
         if src_key_padding_mask is not None:
             # RoIs sometimes have all zero inputs. This results in a 0/0 division because of masking. Thus, we
             # remove the empty rois to prevent this issue(https://github.com/pytorch/pytorch/issues/24816#issuecomment-524415617)
             empty_rois_mask = src_key_padding_mask.all(-1)
+            #* 如果一个roi里面的所有grid point周围都没特征点, 那就不选取这些roi, [过滤后的roi个数, grid_size**3, C]
             attended_features_filtered = attended_features[~empty_rois_mask]
 
             if self.pos_encoder is not None:
@@ -38,7 +40,7 @@ class TransformerEncoder(nn.Module):
                 attended_features_filtered[~src_key_padding_mask_filtered] = self.pos_encoder(attended_features_filtered,
                                                                                               positional_input[~empty_rois_mask] if positional_input is not None else None)[~src_key_padding_mask_filtered]
 
-            # (b, xyz, f) -> (xyz, b, f)
+            #* [batch_size*roi_num, grid_size**3, C]->[grid_size**3, batch_size*roi_num, C]
             attended_features_filtered = attended_features_filtered.permute(1, 0, 2)
             # (xyz, b, f) -> (b, xyz, f)
             attended_features[~empty_rois_mask] = self.transformer_encoder(attended_features_filtered,
@@ -126,7 +128,7 @@ class FeedForwardPositionalEncoding(nn.Module):
         )
 
     def forward(self, point_features, positional_input, grid_size=None):
-        """
+        """对位置信息进行Conv1d, 
         Args:
             point_features: (b, xyz, f)
             local_point_locations: (b, xyz, 3)

@@ -127,13 +127,13 @@ MODEL:
                     POOL_RADIUS: [0.4, 0.8]
                     NSAMPLE: [16, 16]
                     POOL_METHOD: max_pool
-                    USE_DENSITY: True
+                    USE_DENSITY: False
                 x_conv4:
                     MLPS: [[32, 32], [32, 32]]
                     POOL_RADIUS: [0.8, 1.6]
                     NSAMPLE: [16, 16]
                     POOL_METHOD: max_pool
-                    USE_DENSITY: True
+                    USE_DENSITY: False
 
             ATTENTION:
                 ENABLED: True

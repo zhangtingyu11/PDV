@@ -62,7 +62,9 @@ class RoIHeadTemplate(nn.Module):
 
         """
         batch_size = batch_dict['batch_size']
+        #* [batch_size, 200*176*2*3, 7] 包围框预测结果
         batch_box_preds = batch_dict['batch_box_preds']
+        #* [batch_size, 200*176*2*3, 3] 类别预测结果
         batch_cls_preds = batch_dict['batch_cls_preds']
         rois = batch_box_preds.new_zeros((batch_size, nms_config.NMS_POST_MAXSIZE, batch_box_preds.shape[-1]))
         roi_scores = batch_box_preds.new_zeros((batch_size, nms_config.NMS_POST_MAXSIZE))
@@ -102,29 +104,53 @@ class RoIHeadTemplate(nn.Module):
         if nms_config.get('ROI_ANCHOR_INDICES', False):
             batch_dict['roi_anchor_indices'] = anchor_indices
         batch_dict.pop('batch_index', None)
+        """
+        Returns:
+            batch_dict: 
+                rois: [batch_size, NMS_POST_MAXSIZE, 7], 表示roi框的预测值
+                roi_scores: [batch_size, NMS_POST_MAXSIZE], 表示roi的分类分数
+                roi_labels: [batch_size, NMS_POST_MAXSIZE], 表示roi的标签, 也不能说是标签, 就是分类值最大的那个类别
+                has_class_labels: 是否根据类别来分类, True
+        """
         return batch_dict
 
     def assign_targets(self, batch_dict):
         batch_size = batch_dict['batch_size']
         with torch.no_grad():
+            """
+                Returns:
+                    targets_dict: 
+                        rois: [batch_size, roi_num, 7], roi的信息, [x, y, z, dx, dy, dz, heading]
+                        gt_of_rois: [batch_size, roi_num, 8], roi对应的gt框的信息, [x, y, z, dx, dy, dz, heading, class]
+                        gt_iou_of_rois: [batch_size, roi_num], roi和对应gt的iou
+                        roi_scores: [batch_size, roi_num], roi对应的置信度
+                        roi_labels: [batch_size, roi_num], roi置信度最高的类别
+                        reg_valid_mask: 满足回归阈值的roi的掩码
+                        rcnn_cls_labels: roi的分类标签
+            """
             targets_dict = self.proposal_target_layer.forward(batch_dict)
 
+        #* rois: [batch_size, roi_num, 7], roi的信息, [x, y, z, dx, dy, dz, heading]
         rois = targets_dict['rois']  # (B, N, 7 + C)
+        #* gt_of_rois: [batch_size, roi_num, 8], roi对应的gt框的信息, [x, y, z, dx, dy, dz, heading, class], heading是-pi~pi
         gt_of_rois = targets_dict['gt_of_rois']  # (B, N, 7 + C + 1)
         targets_dict['gt_of_rois_src'] = gt_of_rois.clone().detach()
 
         # canonical transformation
         roi_center = rois[:, :, 0:3]
+        #* roi的航向角转到0~2pi
         roi_ry = rois[:, :, 6] % (2 * np.pi)
         gt_of_rois[:, :, 0:3] = gt_of_rois[:, :, 0:3] - roi_center
         gt_of_rois[:, :, 6] = gt_of_rois[:, :, 6] - roi_ry
 
         # transfer LiDAR coords to local coords
+        #* 将gt从lidar坐标系转到roi坐标系下
         gt_of_rois = common_utils.rotate_points_along_z(
             points=gt_of_rois.view(-1, 1, gt_of_rois.shape[-1]), angle=-roi_ry.view(-1)
         ).view(batch_size, -1, gt_of_rois.shape[-1])
 
         # flip orientation if rois have opposite orientation
+        #* 将gt的heading从-pi~pi转到-pi/2~pi/2
         heading_label = gt_of_rois[:, :, 6] % (2 * np.pi)  # 0 ~ 2pi
         opposite_flag = (heading_label > np.pi * 0.5) & (heading_label < np.pi * 1.5)
         heading_label[opposite_flag] = (heading_label[opposite_flag] + np.pi) % (2 * np.pi)  # (0 ~ pi/2, 3pi/2 ~ 2pi)
@@ -134,15 +160,32 @@ class RoIHeadTemplate(nn.Module):
 
         gt_of_rois[:, :, 6] = heading_label
         targets_dict['gt_of_rois'] = gt_of_rois
+        """
+
+        Returns:
+            targets_dict: 
+                rois: [batch_size, roi_num, 7], [x, y, z, dx, dy, dz, heading], heading在0~2pi
+                gt_of_rois: [batch_size, roi_num, 8], [x, y, z, dx, dy, dz, heading, class], heading在-pi/2~pi/2
+                gt_iou_of_rois: [batch_size, roi_num], roi和gt的iou
+                roi_scores: [batch_size, roi_num], roi的置信度
+                roi_labels: [batch_size, roi_num], roi置信度最高的类别
+                reg_valid_mask: [batch_size, roi_num], roi是否计算回归的掩码
+                rcnn_cls_labels: [batch_size, roi_num], roi分类的目标值
+                gt_of_rois_src: [batch_size, roi_num, 8], [x, y, z, dx, dy, dz, heading, class], heading在-pi~pi
+        """
         return targets_dict
 
     def get_box_reg_layer_loss(self, forward_ret_dict):
         loss_cfgs = self.model_cfg.LOSS_CONFIG
         code_size = self.box_coder.code_size
         reg_valid_mask = forward_ret_dict['reg_valid_mask'].view(-1)
+        #* [batch_size, roi_num, 7], [x,y,z,dx,dy,dz,heading], heading为-pi/2~pi/2
         gt_boxes3d_ct = forward_ret_dict['gt_of_rois'][..., 0:code_size]
+        #* [batch_size*roi_num, 7], [x,y,z,dx,dy,dz,heading], heading为0~2pi
         gt_of_rois_src = forward_ret_dict['gt_of_rois_src'][..., 0:code_size].view(-1, code_size)
+        #* [batch_size*roi_num, 7]
         rcnn_reg = forward_ret_dict['rcnn_reg']  # (rcnn_batch_size, C)
+        #* [batch_size, roi_num, 7]
         roi_boxes3d = forward_ret_dict['rois']
         rcnn_batch_size = gt_boxes3d_ct.view(-1, code_size).shape[0]
 
@@ -155,6 +198,7 @@ class RoIHeadTemplate(nn.Module):
             rois_anchor = roi_boxes3d.clone().detach().view(-1, code_size)
             rois_anchor[:, 0:3] = 0
             rois_anchor[:, 6] = 0
+            #* 直接预测位置, 并不是预测和anchor位置的差值, 但是尺寸是预测差值
             reg_targets = self.box_coder.encode_torch(
                 gt_boxes3d_ct.view(rcnn_batch_size, code_size), rois_anchor
             )
@@ -202,7 +246,9 @@ class RoIHeadTemplate(nn.Module):
 
     def get_box_cls_layer_loss(self, forward_ret_dict):
         loss_cfgs = self.model_cfg.LOSS_CONFIG
+        #* [batch_size*roi_num, 1]
         rcnn_cls = forward_ret_dict['rcnn_cls']
+        #* [batch_size*roi_num]
         rcnn_cls_labels = forward_ret_dict['rcnn_cls_labels'].view(-1)
         if loss_cfgs.CLS_LOSS == 'BinaryCrossEntropy':
             rcnn_cls_flat = rcnn_cls.view(-1)

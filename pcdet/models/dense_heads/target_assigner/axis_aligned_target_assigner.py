@@ -36,8 +36,8 @@ class AxisAlignedTargetAssigner(object):
     def assign_targets(self, all_anchors, gt_boxes_with_classes):
         """
         Args:
-            all_anchors: [(N, 7), ...]
-            gt_boxes: (B, M, 8)
+            all_anchors: [(B, H, W, 1, anchor_num, box_code_size)]
+            gt_boxes: (B, M, 8), [x, y, z, dx, dy, dz, heading, class]
         Returns:
 
         """
@@ -77,7 +77,9 @@ class AxisAlignedTargetAssigner(object):
                     selected_classes = cur_gt_classes[mask]
                 else:
                     feature_map_size = anchors.shape[:3]
+                    #* [anchor_total_num,  box_code_size]
                     anchors = anchors.view(-1, anchors.shape[-1])
+                    #* selected_classes为符合这个类别的gt的类别
                     selected_classes = cur_gt_classes[mask]
 
                 single_target = self.assign_targets_single(
@@ -101,32 +103,49 @@ class AxisAlignedTargetAssigner(object):
                 target_dict['reg_weights'] = torch.cat(target_dict['reg_weights'], dim=0).view(-1)
             else:
                 target_dict = {
+                    #* box_cls_labels是个列表, 列表里面存储每个anchor的对应类别, shape为[1, 200, 176, 2]
                     'box_cls_labels': [t['box_cls_labels'].view(*feature_map_size, -1) for t in target_list],
+                    #* box_reg_targets是个列表, 列表里面存储每个anchor的对应包围框, shape为[1, 200, 176, 2, 7]
                     'box_reg_targets': [t['box_reg_targets'].view(*feature_map_size, -1, self.box_coder.code_size)
                                         for t in target_list],
+                    #* reg_weights是个列表, 列表里面存储每个anchor的对应regression weight, shape为[1, 200, 176, 2]
                     'reg_weights': [t['reg_weights'].view(*feature_map_size, -1) for t in target_list]
                 }
+                #* target_dict['box_reg_targets']变为[200*176*2*3, 7]
                 target_dict['box_reg_targets'] = torch.cat(
                     target_dict['box_reg_targets'], dim=-2
                 ).view(-1, self.box_coder.code_size)
 
+                #* target_dict['box_cls_labels']变为[200*176*2*3]
                 target_dict['box_cls_labels'] = torch.cat(target_dict['box_cls_labels'], dim=-1).view(-1)
+                #* target_dict['reg_weights']变为[200*176*2*3]
                 target_dict['reg_weights'] = torch.cat(target_dict['reg_weights'], dim=-1).view(-1)
 
             bbox_targets.append(target_dict['box_reg_targets'])
             cls_labels.append(target_dict['box_cls_labels'])
             reg_weights.append(target_dict['reg_weights'])
 
+        #* 将多个batch合并在一起, [B, 200*176*2*3, 7]
         bbox_targets = torch.stack(bbox_targets, dim=0)
 
+        #* 将多个batch合并在一起, [B, 200*176*2*3]
         cls_labels = torch.stack(cls_labels, dim=0)
+        #* 将多个batch合并在一起, [B, 200*176*2*3]
         reg_weights = torch.stack(reg_weights, dim=0)
+        
         all_targets_dict = {
             'box_cls_labels': cls_labels,
             'box_reg_targets': bbox_targets,
             'reg_weights': reg_weights
 
         }
+        """
+        Returns:
+            all_targets_dict: 
+                box_cls_labels: [B, 200*176*2*3, 7]
+                box_reg_targets: [B, 200*176*2*3]
+                reg_weights: [B, 200*176*2*3]
+        """
         return all_targets_dict
 
     def assign_targets_single(self, anchors, gt_boxes, gt_classes, matched_threshold=0.6, unmatched_threshold=0.45):
@@ -138,24 +157,34 @@ class AxisAlignedTargetAssigner(object):
         gt_ids = torch.ones((num_anchors,), dtype=torch.int32, device=anchors.device) * -1
 
         if len(gt_boxes) > 0 and anchors.shape[0] > 0:
+            #* anchor_by_gt_overlap为[anchor_total_num, gt_num], 表示每个anchor和gt的iou
             anchor_by_gt_overlap = iou3d_nms_utils.boxes_iou3d_gpu(anchors[:, 0:7], gt_boxes[:, 0:7]) \
                 if self.match_height else box_utils.boxes3d_nearest_bev_iou(anchors[:, 0:7], gt_boxes[:, 0:7])
 
+            #* 存储anchor对应的iou最大的gt框的索引, [anchor_total_num]
             anchor_to_gt_argmax = torch.from_numpy(anchor_by_gt_overlap.cpu().numpy().argmax(axis=1)).cuda()
+            #* 存储anchor和对应的iou最大的gt框的iou, [anchor_total_num]
             anchor_to_gt_max = anchor_by_gt_overlap[
                 torch.arange(num_anchors, device=anchors.device), anchor_to_gt_argmax
             ]
 
+            #* 存储gt对应的iou最大的anchor的索引, [gt_num]
             gt_to_anchor_argmax = torch.from_numpy(anchor_by_gt_overlap.cpu().numpy().argmax(axis=0)).cuda()
+            #* 存储gt和对应的iou最大的anchor的iou, [gt_num]
             gt_to_anchor_max = anchor_by_gt_overlap[gt_to_anchor_argmax, torch.arange(num_gt, device=anchors.device)]
+            #* 没有对应anchor的gt的掩码, 将这些gt和对应anchor的iou设置为-1
             empty_gt_mask = gt_to_anchor_max == 0
             gt_to_anchor_max[empty_gt_mask] = -1
 
+            #* 找到与gt拥有最大iou的anchor的索引
             anchors_with_max_overlap = (anchor_by_gt_overlap == gt_to_anchor_max).nonzero()[:, 0]
+            #* 获取这些anchor对应的gt的索引
             gt_inds_force = anchor_to_gt_argmax[anchors_with_max_overlap]
+            #* 将这些anchor的类别设置成gt的类别
             labels[anchors_with_max_overlap] = gt_classes[gt_inds_force]
             gt_ids[anchors_with_max_overlap] = gt_inds_force.int()
 
+            #* 和gt的最大iou大于matched_threshold即为positive, 给这些anchor也赋值
             pos_inds = anchor_to_gt_max >= matched_threshold
             gt_inds_over_thresh = anchor_to_gt_argmax[pos_inds]
             labels[pos_inds] = gt_classes[gt_inds_over_thresh]
@@ -206,4 +235,10 @@ class AxisAlignedTargetAssigner(object):
             'box_reg_targets': bbox_targets,
             'reg_weights': reg_weights,
         }
+        """
+        Returns:
+            box_cls_labels: anchor的类别, >0为前景anchor, =0为背景anchor, [anchor_total_num]
+            box_reg_targets: anchor的包围框, [anchor_total_num, 7], [xt, yt, zt, dxt, dyt, dzt, rts]
+            reg_weights: [anchor_total_num], 回归的权重
+        """
         return ret_dict

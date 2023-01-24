@@ -28,6 +28,20 @@ extern THCState *state;
 } while (0)
 #define CHECK_INPUT(x) CHECK_CUDA(x);CHECK_CONTIGUOUS(x)
 
+//**
+ * @brief 
+ * 
+ * @param B batch_size
+ * @param M grid_point的个数
+ * @param radius 搜索的半径
+ * @param nsample 半径内搜索多少个点
+ * @param new_xyz_tensor grid_point的坐标
+ * @param new_xyz_batch_cnt_tensor 每个batch中有多少个grid point
+ * @param xyz_tensor 特征点的坐标
+ * @param xyz_batch_cnt_tensor 每个batch中有多少个特征点
+ * @param idx_tensor [grid point个数, nsample]
+ * @return int 
+ */
 int ball_query_count_wrapper_stack(int B, int M, float radius, int nsample,
     at::Tensor new_xyz_tensor, at::Tensor new_xyz_batch_cnt_tensor,
     at::Tensor xyz_tensor, at::Tensor xyz_batch_cnt_tensor, at::Tensor idx_tensor) {

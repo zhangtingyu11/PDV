@@ -13,6 +13,35 @@ class VoxelAggregationHead(RoIHeadTemplate):
     def __init__(self, input_channels, model_cfg, point_cloud_range, voxel_size, num_class=1, **kwargs):
         super().__init__(num_class=num_class, model_cfg=model_cfg)
         self.model_cfg = model_cfg
+        """
+            self.pool_cfg:
+                ATTENTION:
+                    COMBINE:
+                    DROPOUT:
+                    ENABLED:
+                    MASK_EMPTY_POINTS:
+                    MAX_NUM_BOXES:
+                    NUM_FEATURES: 
+                    NUM_HEADS: Transformer Encoder层的注意力头数
+                    NUMN_HIDDEN_FEATURES:
+                    NUM_LAYERS:
+                    POSITIONAL_ENCODER: 位置编码的类别
+                FEATURE_LOCATIONS:
+                GRID_SIZE: 每个维度切分成多少个grid 
+                POOL_LAYERS:
+                    x_conv3:
+                        MLPS:
+                        NSAMPLE:
+                        POOL_METHOD:
+                        POOL_RADIUS:
+                        USE_DENSITY:
+                    x_conv4:
+                        MLPS:
+                        NSAMPLE:
+                        POOL_METHOD:
+                        POOL_RADIUS:
+                        USE_DENSITY:
+        """
         self.pool_cfg = model_cfg.ROI_GRID_POOL
         layer_cfg = self.pool_cfg.POOL_LAYERS
         self.point_cloud_range = point_cloud_range
@@ -24,6 +53,7 @@ class VoxelAggregationHead(RoIHeadTemplate):
             mlps = layer_cfg[src_name].MLPS
             for k in range(len(mlps)):
                 mlps[k] = [self.model_cfg.VOXEL_AGGREGATION.NUM_FEATURES[i]] + mlps[k]
+            #* 为StackSAModuleMSGAttention
             stack_sa_module_msg = StackSAModuleMSGAttention if self.pool_cfg.get('ATTENTION', {}).get('ENABLED') else StackSAModuleMSG
             pool_layer = stack_sa_module_msg(
                 radii=layer_cfg[src_name].POOL_RADIUS,
@@ -112,7 +142,7 @@ class VoxelAggregationHead(RoIHeadTemplate):
         Args:
             batch_dict:
                 batch_size:
-                rois: (B, num_rois, 7 + C)
+                rois: (B, num_rois, 7)
                 point_coords: (num_points, 4)  [bs_idx, x, y, z]
                 point_features: (num_points, C)
                 point_cls_scores: (N1 + N2 + N3 + ..., 1)
@@ -123,6 +153,10 @@ class VoxelAggregationHead(RoIHeadTemplate):
         batch_size = batch_dict['batch_size']
         batch_rois = batch_dict['rois']
 
+        """
+            global_roi_grid_points: [B*roi_num, grid_size**3, 3], 在lidar坐标系下的grid point的坐标
+            local_roi_grid_points: [B*roi_num, grid_size**3, 3], 在roi坐标系下的grid point的坐标
+        """
         global_roi_grid_points, local_roi_grid_points = self.get_global_grid_points_of_roi(
             batch_dict, grid_size=self.model_cfg.ROI_GRID_POOL.GRID_SIZE
         )  # (BxN, 6x6x6, 3)
@@ -133,17 +167,28 @@ class VoxelAggregationHead(RoIHeadTemplate):
         pooled_features_list = []
         ball_idxs_list = []
         for k, src_name in enumerate(self.pool_cfg.FEATURE_LOCATIONS):
+            #* [voxel对应特征图位置不为0的位置, 3]
             point_coords = batch_dict['point_coords'][src_name]
+            #* [voxel对应特征图位置不为0的位置, C]
             point_features = batch_dict['point_features'][src_name]
             pool_layer = self.roi_grid_pool_layers[k]
 
+            #* 点的坐标
             xyz = point_coords[:, 1:4]
+            #* 每个batch有多少个点
             xyz_batch_cnt = xyz.new_zeros(batch_size).int()
             batch_idx = point_coords[:, 0]
             for k in range(batch_size):
                 xyz_batch_cnt[k] = (batch_idx == k).sum()
 
+            #* 每个batch有多少个grid_point
             new_xyz_batch_cnt = xyz.new_zeros(batch_size).int().fill_(global_roi_grid_points.shape[1])
+            """
+            pool_output:
+                new_xyz: grid point的坐标, [grid_point个数, 3]
+                new_features: grid_point在多个grouper整合出来的特征拼接后的结果, [grid_point个数, C]
+                all_ball_idxs: grid_point, grid_point在多个grouper特征点的索引的拼接, [grid_point个数, nsample*grouper_num]
+            """
             pool_output = pool_layer(
                 xyz=xyz.contiguous(),
                 xyz_batch_cnt=xyz_batch_cnt,
@@ -156,7 +201,8 @@ class VoxelAggregationHead(RoIHeadTemplate):
                 _, pooled_features, ball_idxs = pool_output
             else:
                 _, pooled_features = pool_output
-
+            
+            #* pool_output: [grid_point个数, C]->[batch_size*roi_num, grid_size**3, C]
             pooled_features = pooled_features.view(
                 -1, self.model_cfg.ROI_GRID_POOL.GRID_SIZE ** 3,
                 pooled_features.shape[-1]
@@ -164,20 +210,30 @@ class VoxelAggregationHead(RoIHeadTemplate):
             pooled_features_list.append(pooled_features)
 
             if self.pool_cfg.get('ATTENTION', {}).get('ENABLED'):
+                #* [grid_point个数, nsample*grouper_num]->[batch_size*roi_num, grid_size**3, nsample*grouper_num]
                 ball_idxs = ball_idxs.view(
                     -1, self.model_cfg.ROI_GRID_POOL.GRID_SIZE **3,
                     ball_idxs.shape[-1]
                 )
                 ball_idxs_list.append(ball_idxs)
 
+        #* 将不同特征图下整合的特征进行拼接, [batch_size*roi_num, grid_size**3, C]
         all_pooled_features = torch.cat(pooled_features_list, dim=-1)
         if self.pool_cfg.get('ATTENTION', {}).get('ENABLED'):
             all_ball_idxs = torch.cat(ball_idxs_list, dim=-1)
         else:
             all_ball_idxs = []
+        """
+        Returns:
+            all_pooled_features: [batch_size*roi_num, grid_size**3, C], grid_point的特征
+            global_roi_grid_points: lidar坐标系下的grid point的坐标, [batch_size, roi_num*grid_size**3, 3]
+            local_roi_grid_points: roi坐标系下的grid point的坐标, [batch_size, roi_num*grid_size**3, C]
+            all_ball_idxs: [batch_size*roi_num, grid_size**3, nsample*grouper_idx], grid_point周围的特征点的索引
+        """
         return all_pooled_features, global_roi_grid_points, local_roi_grid_points, all_ball_idxs
 
     def get_global_grid_points_of_roi(self, batch_dict, grid_size):
+        #* rois: [batch_size, roi_num, 7]
         rois = batch_dict['rois']
         rois = rois.view(-1, rois.shape[-1])
         batch_size_rcnn = rois.shape[0]
@@ -189,10 +245,24 @@ class VoxelAggregationHead(RoIHeadTemplate):
         ).squeeze(dim=1)
         global_center = rois[:, 0:3].clone()
         global_roi_grid_points += global_center.unsqueeze(dim=1)
+        """
+        Returns:
+            global_roi_grid_points: [B*roi_num, grid_size**3, 3], 在lidar坐标系下的grid point的坐标
+            local_roi_grid_points: [B*roi_num, grid_size**3, 3], 在roi坐标系下的grid point的坐标
+        """
         return global_roi_grid_points, local_roi_grid_points
 
     @staticmethod
     def get_dense_grid_points(rois, batch_size_rcnn, grid_size):
+        """
+        Args:
+            rois (_type_): [batch_size, roi_num, 7]
+            batch_size_rcnn (_type_): batch_size*roi_num
+            grid_size (_type_): 将roi分成成各个维度多少个grid
+
+        Returns:
+            _type_: _description_
+        """
         faked_features = rois.new_ones((grid_size, grid_size, grid_size))
         dense_idx = faked_features.nonzero()  # (N, 3) [x_idx, y_idx, z_idx]
         dense_idx = dense_idx.repeat(batch_size_rcnn, 1, 1).float()  # (B, 6x6x6, 3)
@@ -200,26 +270,31 @@ class VoxelAggregationHead(RoIHeadTemplate):
         local_roi_size = rois.view(batch_size_rcnn, -1)[:, 3:6]
         roi_grid_points = (dense_idx + 0.5) / grid_size * local_roi_size.unsqueeze(dim=1) \
                           - (local_roi_size.unsqueeze(dim=1) / 2)  # (B, 6x6x6, 3)
+        #* [B*roi_num, grid_size**3, 3], 返回每个grid_point在roi坐标系下的坐标
         return roi_grid_points
 
     def get_point_voxel_features(self, batch_dict):
         raise NotImplementedError
 
     def get_positional_input(self, points, rois, local_roi_grid_points):
+        #* [batch_size, roi_num, grid_size, grid_size, grid_size], 记录每个roi的每个grid中点的个数
         points_per_part = density_utils.find_num_points_per_part_multi(points,
                                                                        rois,
                                                                        self.model_cfg.ROI_GRID_POOL.GRID_SIZE,
                                                                        self.pool_cfg.ATTENTION.MAX_NUM_BOXES,
                                                                        return_centroid=self.pool_cfg.ATTENTION.POSITIONAL_ENCODER == 'density_centroid')
         points_per_part_num_features = 1 if len(points_per_part.shape) <= 5 else points_per_part.shape[-1]
+        #* [batch_size, roi_num, grid_size, grid_size, grid_size]-> [batch_size*roi_num, grid_size**3, 1]
         points_per_part = points_per_part.view(points_per_part.shape[0]*points_per_part.shape[1], -1, points_per_part_num_features).float()
         # First feature is density, other potential features are xyz
+        #* log10(值为grid中的点的个数+0.5)
         points_per_part[..., 0] = torch.log10(points_per_part[..., 0] + 0.5) - (math.log10(0.5) if self.model_cfg.get('DENSITY_LOG_SHIFT') else 0)
         if self.pool_cfg.ATTENTION.POSITIONAL_ENCODER == 'grid_points':
             positional_input = local_roi_grid_points
         elif self.pool_cfg.ATTENTION.POSITIONAL_ENCODER == 'density':
             positional_input = points_per_part
         elif self.pool_cfg.ATTENTION.POSITIONAL_ENCODER == 'density_grid_points':
+            #* 将点在roi坐标系下的坐标和密度特征进行拼接
             positional_input = torch.cat((local_roi_grid_points, points_per_part), dim=-1)
         else:
             positional_input = None
@@ -230,35 +305,77 @@ class VoxelAggregationHead(RoIHeadTemplate):
         :param input_data: input dict
         :return:
         """
+        """
+        Returns:
+            batch_dict['point_features']: 字典
+                key为特征图的名字
+                value为当前尺度的非空voxel对应的特征图的特征, [非空voxel对应的特征图不为0的个数, C]
+            batch_dict['point_coords']: 字典
+                key为特征图的名字
+                value为当前尺度的非空voxel对应的特征图的位置, 位置为voxel里面点的平均值[batch_idx, x, y, z], 如果对应的特征图中的位置为0, 
+                    [非空voxel对应的特征图不为0的个数, 4]
+        """
         batch_dict['point_features'], batch_dict['point_coords'] = self.get_point_voxel_features(batch_dict)
 
+
+        """
+        Returns:
+            targets_dict: 
+                rois: [batch_size, NMS_POST_MAXSIZE, 7], 表示roi框的预测值
+                roi_scores: [batch_size, NMS_POST_MAXSIZE], 表示roi的分类分数
+                roi_labels: [batch_size, NMS_POST_MAXSIZE], 表示roi的标签, 也不能说是标签, 就是分类值最大的那个类别
+                has_class_labels: 是否根据类别来分类, True
+        """
         targets_dict = self.proposal_layer(
             batch_dict, nms_config=self.model_cfg.NMS_CONFIG['TRAIN' if self.training else 'TEST']
         )
         if self.training:
+            """
+            targets_dict: 
+                rois: [batch_size, roi_num, 7], [x, y, z, dx, dy, dz, heading], heading在0~2pi
+                gt_of_rois: [batch_size, roi_num, 8], [x, y, z, dx, dy, dz, heading, class], heading在-pi/2~pi/2
+                gt_iou_of_rois: [batch_size, roi_num], roi和gt的iou
+                roi_scores: [batch_size, roi_num], roi的置信度
+                roi_labels: [batch_size, roi_num], roi置信度最高的类别
+                reg_valid_mask: [batch_size, roi_num], roi是否计算回归的掩码
+                rcnn_cls_labels: [batch_size, roi_num], roi分类的目标值
+                gt_of_rois_src: [batch_size, roi_num, 8], [x, y, z, dx, dy, dz, heading, class], heading在-pi~pi
+            """
             targets_dict = self.assign_targets(batch_dict)
             batch_dict['rois'] = targets_dict['rois']
             batch_dict['roi_labels'] = targets_dict['roi_labels']
 
         # RoI aware pooling
+        """
+            pooled_features: [batch_size*roi_num, grid_size**3, C], grid_point的特征
+            global_roi_grid_points: lidar坐标系下的grid point的坐标, [batch_size, roi_num*grid_size**3, 3]
+            local_roi_grid_points: roi坐标系下的grid point的坐标, [batch_size, roi_num*grid_size**3, C]
+            ball_idxs: [batch_size*roi_num, grid_size**3, nsample*grouper_idx], grid_point周围的特征点的索引
+        """
         pooled_features, global_roi_grid_points, local_roi_grid_points, ball_idxs = self.roi_grid_pool(batch_dict)  # (BxN, 6x6x6, C)
         batch_size_rcnn = pooled_features.shape[0]
 
         if self.pool_cfg.get('ATTENTION', {}).get('ENABLED'):
             src_key_padding_mask = None
             if self.pool_cfg.ATTENTION.get('MASK_EMPTY_POINTS'):
+                #* [batch_size*roi_num, grid_size**3], True周围该grid point周围没有特征点
+                #? 如果这个grid point周围只有一个特征点, 特征点的索引是0怎么办？
                 src_key_padding_mask = (ball_idxs == 0).all(-1)
 
+            #* 获取[batch_size*roi_num, grid_size**3, 4], 获取每个grid的位置特征(带grid的密度)
             positional_input = self.get_positional_input(batch_dict['points'], batch_dict['rois'], local_roi_grid_points)
             # Attention
+            #* [batch_size, grid_size**3, C]
             attention_output = self.attention_head(pooled_features, positional_input, src_key_padding_mask) # (BxN, 6x6x6, C)
 
             if self.pool_cfg.ATTENTION.get('COMBINE'):
+                #* 将attention后的结果和attention前的结果进行相加
                 attention_output = pooled_features + attention_output
 
             # Permute
             grid_size = self.model_cfg.ROI_GRID_POOL.GRID_SIZE
             batch_size_rcnn = attention_output.shape[0]
+            #* [batch_size*roi_num, C, grid_size, grid_size, grid_size]
             pooled_features = attention_output.permute(0, 2, 1).\
                 contiguous().view(batch_size_rcnn, -1, grid_size, grid_size, grid_size) # (BxN, C, 6, 6, 6)
 
@@ -275,9 +392,11 @@ class VoxelAggregationHead(RoIHeadTemplate):
                                                                                batch_box_preds,
                                                                                self.model_cfg.DENSITY_CONFIDENCE.GRID_SIZE,
                                                                                self.model_cfg.DENSITY_CONFIDENCE.MAX_NUM_BOXES)
+                #* [batch_size*roi_num, 1, 1], 每个包围框里面点的密度
                 points_per_part = torch.log10(points_per_part.float() + 0.5).reshape(-1, self.model_cfg.DENSITY_CONFIDENCE.GRID_SIZE ** 3, 1) - (math.log10(0.5) if self.model_cfg.get('DENSITY_LOG_SHIFT') else 0)
                 point_cloud_range = torch.tensor(self.point_cloud_range, device=batch_box_preds.device)
                 batch_box_preds_xyz = batch_box_preds.reshape(-1, batch_box_preds.shape[-1], 1)[:, :3]
+                #* 将包围框的中心点转到0-1之间
                 batch_box_preds_xyz /= (point_cloud_range[3:] - point_cloud_range[:3]).unsqueeze(0).unsqueeze(-1)
 
                 density_features = [points_per_part, batch_box_preds_xyz]
@@ -302,6 +421,11 @@ class VoxelAggregationHead(RoIHeadTemplate):
             targets_dict['rcnn_cls'] = rcnn_cls
             targets_dict['rcnn_reg'] = rcnn_reg
 
+            """
+                self.forward_ret_dict:
+                    rcnn_cls: [batch_size*roi_num, 1]
+                    rcnn_reg: [batch_size*roi_num, 7]
+            """
             self.forward_ret_dict = targets_dict
 
         return batch_dict
@@ -339,6 +463,14 @@ class PDVHead(VoxelAggregationHead):
     def get_point_voxel_features(self, batch_dict):
         point_features = {}
         point_coords = {}
+        """
+            centroids_all: 字典, 
+                key是特征图名字
+                value是[唯一的voxel个数, 5], [batch_idx, avg_x_in_voxel, avg_y_in_voxel, avg_z_in_voxel, avg_intensity_in_voxel]
+            centroid_voxel_idxs_all: 字典
+                key是特征图名字
+                value是[唯一的voxel个数, 4], [batch_idx, xidx, yidx, zidx]
+        """
         centroids_all, centroid_voxel_idxs_all = voxel_aggregation_utils.get_centroids_per_voxel_layer(batch_dict['points'],
                                                                                                        self.model_cfg.VOXEL_AGGREGATION.FEATURE_LOCATIONS,
                                                                                                        batch_dict['multi_scale_3d_strides'],
@@ -347,7 +479,10 @@ class PDVHead(VoxelAggregationHead):
         for feature_location in self.model_cfg.VOXEL_AGGREGATION.FEATURE_LOCATIONS:
             centroids = centroids_all[feature_location][:, :4]
             centroid_voxel_idxs = centroid_voxel_idxs_all[feature_location]
+            #* xconv为当前特征图的稀疏张量
             x_conv = batch_dict['multi_scale_3d_features'][feature_location]
+            #* overlapping_voxel_feature_indices_nonempty表示非空voxel所在位置特征图不为0的话其在特征稀疏张量里的索引
+            #* overlapping_voxel_feature_nonempty_mask表示每个voxel在特征图上是否为0
             overlapping_voxel_feature_indices_nonempty, overlapping_voxel_feature_nonempty_mask = \
                 voxel_aggregation_utils.get_nonempty_voxel_feature_indices(centroid_voxel_idxs, x_conv)
 
@@ -373,8 +508,19 @@ class PDVHead(VoxelAggregationHead):
                 point_coords[feature_location] = voxel_points
             else:
                 x_conv_features = torch.zeros((centroids.shape[0], x_conv.features.shape[-1]), dtype=x_conv.features.dtype, device=centroids.device)
+                #* 对于voxel对应特征图上的位置如果不为0, 则将这个位置的特征赋值给它
                 x_conv_features[overlapping_voxel_feature_nonempty_mask] = x_conv.features[overlapping_voxel_feature_indices_nonempty]
 
                 point_features[feature_location] = x_conv_features[overlapping_voxel_feature_nonempty_mask]
                 point_coords[feature_location] = centroids[overlapping_voxel_feature_nonempty_mask]
+        """
+        Returns:
+            point_features: 字典
+                key为特征图的名字
+                value为当前尺度的非空voxel对应的特征图的特征, [非空voxel对应的特征图不为0的个数, C]
+            point_coords: 字典
+                key为特征图的名字
+                value为当前尺度的非空voxel对应的特征图的位置, 位置为voxel里面点的平均值[batch_idx, x, y, z]
+                    [非空voxel对应的特征图不为0的个数, 4]
+        """
         return point_features, point_coords

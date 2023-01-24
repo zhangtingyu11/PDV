@@ -1,0 +1,5 @@
+"name",car_easy,car_moderate,car_hard,pedestrian_easy,pedestrian_moderate,pedestrian_hard,cyclist_easy,cyclist_moderate,cyclist_hard
+"pdv_origin",89.4825,84.3824,78.98,66.9248,59.9461,54.798,86.8009,73.297,69.097
+"pdv_no_density",89.4762,84.0234,78.847,64.361,57.4792,52.795,90.9242,74.1505,70.135
+"pdv_part_density_v1",89.0145,84.1552,78.676,66.4283,60.8697,56.009,93.0808,74.5245,70.109
+"pdv_part_density_v2",89.2263,83.946,78.812,64.6801,59.0018,54.238,92.5989,74.1443,70.64

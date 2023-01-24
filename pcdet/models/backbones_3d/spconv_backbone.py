@@ -71,6 +71,7 @@ class VoxelBackBone8x(nn.Module):
         self.model_cfg = model_cfg
         norm_fn = partial(nn.BatchNorm1d, eps=1e-3, momentum=0.01)
 
+        #* 网上说这边+1是因为可以在kernel_size为3, padding为1, stride为2的情况下边上也能处理到
         self.sparse_shape = grid_size[::-1] + [1, 0, 0]
 
         self.conv_input = spconv.SparseSequential(
@@ -84,6 +85,7 @@ class VoxelBackBone8x(nn.Module):
             block(16, 16, 3, norm_fn=norm_fn, padding=1, indice_key='subm1'),
         )
 
+        #* 下采样的时候都使用spconv, 不改变尺寸的时候都使用submanifold spconv
         self.conv2 = spconv.SparseSequential(
             # [1600, 1408, 41] <- [800, 704, 21]
             block(16, 32, 3, norm_fn=norm_fn, stride=2, padding=1, indice_key='spconv2', conv_type='spconv'),
@@ -107,6 +109,7 @@ class VoxelBackBone8x(nn.Module):
 
         last_pad = 0
         last_pad = self.model_cfg.get('last_pad', last_pad)
+        #* 最后一个卷积只对高度做下采样
         self.conv_out = spconv.SparseSequential(
             # [200, 150, 5] -> [200, 150, 2]
             spconv.SparseConv3d(64, 128, (3, 1, 1), stride=(2, 1, 1), padding=last_pad,
@@ -129,7 +132,7 @@ class VoxelBackBone8x(nn.Module):
         Args:
             batch_dict:
                 batch_size: int
-                vfe_features: (num_voxels, C)
+                voxel_features: (num_voxels, C)
                 voxel_coords: (num_voxels, 4), [batch_idx, z_idx, y_idx, x_idx]
         Returns:
             batch_dict:
@@ -175,7 +178,23 @@ class VoxelBackBone8x(nn.Module):
                 'x_conv4': 8,
             }
         })
-
+        
+        """
+        Returns:
+            batch_dict: 
+                encoded_spconv_tensor: 最后输出的稀疏tensor: [2, 200, 176]
+                encoded_spconv_tensor_stride: 稀疏卷积的步长累积， 8
+                multi_scale_3d_features
+                    x_conv1: 累积步长为1的稀疏tensor: [41, 1600, 1408]
+                    x_conv2: 累积步长为2的稀疏tensor: [21, 800, 704]
+                    x_conv3: 累积步长为4的稀疏tensor: [11, 400, 352]
+                    x_conv4: 累积步长为8的稀疏tensor: [5, 200, 176]
+                multi_scale_3d_strides:
+                    x_conv1: 不同尺度的稀疏tensor对应的步长, 1
+                    x_conv2: 不同尺度的稀疏tensor对应的步长, 2
+                    x_conv3: 不同尺度的稀疏tensor对应的步长, 4
+                    x_conv4: 不同尺度的稀疏tensor对应的步长, 8
+        """
         return batch_dict
 
 

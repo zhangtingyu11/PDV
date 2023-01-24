@@ -100,11 +100,11 @@ class StackSAModuleMSGAttention(StackSAModuleMSG):
 
     def forward(self, xyz, xyz_batch_cnt, new_xyz, new_xyz_batch_cnt, features=None, empty_voxel_set_zeros=True):
         """
-        :param xyz: (N1 + N2 ..., 3) tensor of the xyz coordinates of the features
-        :param xyz_batch_cnt: (batch_size), [N1, N2, ...]
-        :param new_xyz: (M1 + M2 ..., 3)
-        :param new_xyz_batch_cnt: (batch_size), [M1, M2, ...]
-        :param features: (N1 + N2 ..., C) tensor of the descriptors of the the features
+        :param xyz: (特征点个数, 3) tensor of the xyz coordinates of the features, 特征点的坐标
+        :param xyz_batch_cnt: (batch_size), 每个batch有多少个特征点
+        :param new_xyz: (grid_point个数, 3), grid_point在lidar坐标系下的点坐标
+        :param new_xyz_batch_cnt: (batch_size), 每个batch有多少个grid point
+        :param features: (特征点个数, C) 特征点的特征
         :return:
             new_xyz: (M1 + M2 ..., 3) tensor of the new features' xyz
             new_features: (M1 + M2 ..., \sum_k(mlps[k][-1])) tensor of the new_features descriptors
@@ -112,13 +112,21 @@ class StackSAModuleMSGAttention(StackSAModuleMSG):
         new_features_list = []
         all_ball_idxs = []
         for k in range(len(self.groupers)):
+            """
+                new_features: [grid point个数, C+3+1, nsample]
+                ball_idxs: [grid_point个数, nsample], grid_point周围的特征点的索引, 如果周围没有特征点, 则索引都是0, 
+                            否则不足的用第一个内部第一个点的索引补全
+            """
             new_features, ball_idxs = self.groupers[k](
                 xyz, xyz_batch_cnt, new_xyz, new_xyz_batch_cnt, features
             )  # (M1 + M2, C, nsample)
+            #* [1, C+3+1, grid point个数, nsample]
             new_features = new_features.permute(1, 0, 2).unsqueeze(dim=0)  # (1, C, M1 + M2 ..., nsample)
+            #* [1, C1, grid_point个数, nsample]
             new_features = self.mlps[k](new_features)  # (1, C, M1 + M2 ..., nsample)
 
             if self.pool_method == 'max_pool':
+                #* [1, C1, grid_point个数]
                 new_features = F.max_pool2d(
                     new_features, kernel_size=[1, new_features.size(3)]
                 ).squeeze(dim=-1)  # (1, C, M1 + M2 ...)
@@ -128,6 +136,7 @@ class StackSAModuleMSGAttention(StackSAModuleMSG):
                 ).squeeze(dim=-1)  # (1, C, M1 + M2 ...)
             else:
                 raise NotImplementedError
+            #* [grid_point个数, C1]
             new_features = new_features.squeeze(dim=0).permute(1, 0)  # (M1 + M2 ..., C)
             new_features_list.append(new_features)
             all_ball_idxs.append(ball_idxs)
@@ -135,6 +144,12 @@ class StackSAModuleMSGAttention(StackSAModuleMSG):
         new_features = torch.cat(new_features_list, dim=1)  # (M1 + M2 ..., C)
         all_ball_idxs = torch.cat(all_ball_idxs, dim=1)
 
+        """
+        Returns:
+            new_xyz: grid point的坐标, [grid_point个数, 3]
+            new_features: grid_point在多个grouper整合出来的特征拼接后的结果, [grid_point个数, C]
+            all_ball_idxs: grid_point, grid_point在多个grouper特征点的索引的拼接, [grid_point个数, nsample*grouper_num]
+        """
         return new_xyz, new_features, all_ball_idxs
 
 

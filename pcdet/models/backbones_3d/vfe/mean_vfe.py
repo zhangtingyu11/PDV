@@ -13,6 +13,7 @@ class MeanVFE(VFETemplate):
 
     def forward(self, batch_dict, **kwargs):
         """
+        简单来说就是对voxel内的点的特征求平均来代表这个voxel的特征
         Args:
             batch_dict:
                 voxels: (num_voxels, max_points_per_voxel, C)
@@ -20,7 +21,7 @@ class MeanVFE(VFETemplate):
             **kwargs:
 
         Returns:
-            vfe_features: (num_voxels, C)
+            voxel_features: (num_voxels, C)
         """
         voxel_features, voxel_num_points = batch_dict['voxels'], batch_dict['voxel_num_points']
         points_mean = voxel_features[:, :, :].sum(dim=1, keepdim=False)
